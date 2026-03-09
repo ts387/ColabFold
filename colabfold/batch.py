@@ -10,6 +10,12 @@ from Bio import BiopythonDeprecationWarning # what can possibly go wrong...
 warnings.simplefilter(action='ignore', category=BiopythonDeprecationWarning)
 
 import json
+hasOrjson = False
+try:
+    import orjson
+    hasOrjson = True
+except ImportError:
+    pass
 import logging
 import math
 import sys
@@ -199,6 +205,64 @@ def convert_pdb_to_mmcif(pdb_file: Path):
     cif_io = CFMMCIFIO()
     cif_io.set_structure(structure)
     cif_io.save(str(cif_file), ReplaceOrRemoveHetatmSelect())
+
+def mk_hhsearch_single_entry_db(cif_file: Path, dbdir_cache_path: str):
+    dbdir = Path(dbdir_cache_path)
+    dbdir.mkdir(parents=True, exist_ok=True)
+    tmp_cif_path = str(dbdir_cache_path) + "/1dmy.cif"
+    shutil.copy2(cif_file, tmp_cif_path)
+    # clear internal AF2 cache of mmCIF files
+    templates._read_file.cache_clear()
+    cif_file = Path(tmp_cif_path)
+    pdb70_db_files = dbdir.glob("pdb70*")
+    for f in pdb70_db_files:
+        os.remove(f)
+
+    with open(dbdir.joinpath("pdb70_a3m.ffdata"), "w") as a3m, open(
+        dbdir.joinpath("pdb70_cs219.ffindex"), "w"
+    ) as cs219_index, open(
+        dbdir.joinpath("pdb70_a3m.ffindex"), "w"
+    ) as a3m_index, open(
+        dbdir.joinpath("pdb70_cs219.ffdata"), "w"
+    ) as cs219:
+        n = 1000000
+        index_offset = 0
+        with open(cif_file) as f:
+            cif_string = f.read()
+        cif_fh = StringIO(cif_string)
+        parser = MMCIFParser(QUIET=True)
+        structure = parser.get_structure("none", cif_fh)
+        models = list(structure.get_models())
+        if len(models) != 1:
+            logger.warning(f"WARNING: Found {len(models)} models in {cif_file}. The first model will be used as a template.", )
+            # raise ValueError(
+            #     f"Only single model PDBs are supported. Found {len(models)} models in {cif_file}."
+            # )
+        model = models[0]
+        for chain in model:
+            amino_acid_res = []
+            for res in chain:
+                if res.id[2] != " ":
+                    logger.warning(f"WARNING: Found insertion code at chain {chain.id} and residue index {res.id[1]} of {cif_file}. "
+                                    "This file cannot be used as a template.")
+                    continue
+                    # raise ValueError(
+                    #     f"PDB {cif_file} contains an insertion code at chain {chain.id} and residue "
+                    #     f"index {res.id[1]}. These are not supported."
+                    # )
+                amino_acid_res.append(
+                    residue_constants.restype_3to1.get(res.resname, "X")
+                )
+
+            protein_str = "".join(amino_acid_res)
+            a3m_str = f">{cif_file.stem}_{chain.id}\n{protein_str}\n\0"
+            a3m_str_len = len(a3m_str)
+            a3m_index.write(f"{n}\t{index_offset}\t{a3m_str_len}\n")
+            cs219_index.write(f"{n}\t{index_offset}\t{len(protein_str)}\n")
+            index_offset += a3m_str_len
+            a3m.write(a3m_str)
+            cs219.write("\n\0")
+            n += 1
 
 def mk_hhsearch_db(template_dir: str):
     template_path = Path(template_dir)
@@ -494,20 +558,24 @@ def predict_structure(
                 np.save(files.get("pair_repr","npy"),result["representations"]["pair"])
 
             # write an easy-to-use format (pAE and pLDDT)
-            with files.get("scores","json").open("w") as handle:
-                plddt = result["plddt"][:seq_len]
-                scores = {"plddt": np.around(plddt.astype(float), 2).tolist()}
-                if "predicted_aligned_error" in result:
-                  pae = result["predicted_aligned_error"][:seq_len,:seq_len]
-                  scores.update({"max_pae": pae.max().astype(float).item(),
-                                 "pae": np.around(pae.astype(float), 2).tolist()})
-                  if calc_extra_ptm:
+            plddt = result["plddt"][:seq_len]
+            scores = {"plddt": np.around(plddt.astype(float), 2).tolist()}
+            if "predicted_aligned_error" in result:
+                pae = result["predicted_aligned_error"][:seq_len,:seq_len]
+                scores.update({"max_pae": pae.max().astype(float).item(),
+                                "pae": np.around(pae.astype(float), 2).tolist()})
+                if calc_extra_ptm:
                     scores.update(extra_ptm_output)
-                  for k in ["ptm","iptm"]:
-                    if k in conf[-1]: scores[k] = np.around(conf[-1][k], 2).item()
-                  del pae
-                del plddt
-                json.dump(scores, handle)
+                for k in ["ptm", "iptm"]:
+                    if k in conf[-1]:
+                        scores[k] = np.around(conf[-1][k], 2).item()
+                del pae
+            del plddt
+            file = files.get("scores", "json")
+            if hasOrjson:
+                file.write_bytes(orjson.dumps(scores))
+            else:
+                file.write_text(json.dumps(scores))
 
             del result, unrelaxed_protein
 
@@ -940,75 +1008,107 @@ def unserialize_msa(
     query_seq_len = list(map(int, query_seq_len))
     query_seqs_cardinality = tab_sep_entries[1].split(",")
     query_seqs_cardinality = list(map(int, query_seqs_cardinality))
+    num_chains = len(query_seq_len)
     is_homooligomer = (
-        True if len(query_seq_len) == 1 and query_seqs_cardinality[0] > 1 else False
+        True if num_chains == 1 and query_seqs_cardinality[0] > 1 else False
     )
     is_single_protein = (
-        True if len(query_seq_len) == 1 and query_seqs_cardinality[0] == 1 else False
+        True if num_chains == 1 and query_seqs_cardinality[0] == 1 else False
     )
+
     query_seqs_unique = []
-    prev_query_start = 0
-    # we store the a3m with cardinality of 1
-    for n, query_len in enumerate(query_seq_len):
-        query_seqs_unique.append(
-            a3m_lines[2][prev_query_start : prev_query_start + query_len]
-        )
-        prev_query_start += query_len
-    paired_msa = [""] * len(query_seq_len)
-    unpaired_msa = [""] * len(query_seq_len)
-    already_in = dict()
-    for i in range(1, len(a3m_lines), 2):
+    qcat = a3m_lines[2]
+    prev = 0
+    for qlen in query_seq_len:
+        nxt = prev + max(int(qlen), 0)
+        query_seqs_unique.append(qcat[prev:nxt])
+        prev = nxt
+
+    paired_chunks = [[] for _ in range(num_chains)]
+    unpaired_chunks = [[] for _ in range(num_chains)]
+    already_in = set()
+
+    qlens_local = query_seq_len
+    def _split_by_aln(s):
+        segments = [""] * num_chains
+        has_aa = [False] * num_chains
+        seg_idx = 0
+        aln_count = 0
+        start = 0
+        curr_has_aa = False
+
+        dash = '-'
+        A, Z = 'A', 'Z'
+        a, z = 'a', 'z'
+        n = len(s)
+        i = 0
+        while i < n and seg_idx < num_chains:
+            c = s[i]
+            # non-lowercase are aligned columns
+            if not (a <= c <= z):
+                if c != dash and (A <= c <= Z):
+                    curr_has_aa = True
+                aln_count += 1
+                if aln_count == qlens_local[seg_idx]:
+                    # close current segment
+                    segments[seg_idx] = s[start:i+1]
+                    has_aa[seg_idx] = curr_has_aa
+                    seg_idx += 1
+                    aln_count = 0
+                    start = i + 1
+                    curr_has_aa = False
+            i += 1
+        return segments, has_aa
+
+    i = 1
+    end = len(a3m_lines)
+    while i + 1 < end:
         header = a3m_lines[i]
         seq = a3m_lines[i + 1]
-        if (header, seq) in already_in:
-            continue
-        already_in[(header, seq)] = 1
-        has_amino_acid = [False] * len(query_seq_len)
-        seqs_line = []
-        prev_pos = 0
-        for n, query_len in enumerate(query_seq_len):
-            paired_seq = ""
-            curr_seq_len = 0
-            for pos in range(prev_pos, len(seq)):
-                if curr_seq_len == query_len:
-                    prev_pos = pos
-                    break
-                paired_seq += seq[pos]
-                if seq[pos].islower():
-                    continue
-                if seq[pos] != "-":
-                    has_amino_acid[n] = True
-                curr_seq_len += 1
-            seqs_line.append(paired_seq)
+        i += 2
 
-        # if sequence is paired add them to output
-        if (
-            not is_single_protein
-            and not is_homooligomer
-            and sum(has_amino_acid) > 1 # at least 2 sequences are paired
-        ):
-            header_no_faster = header.replace(">", "")
-            header_no_faster_split = header_no_faster.split("\t")
-            for j in range(0, len(seqs_line)):
-                paired_msa[j] += ">" + header_no_faster_split[j] + "\n"
-                paired_msa[j] += seqs_line[j] + "\n"
+        key = (header, seq)
+        if key in already_in:
+            continue
+        already_in.add(key)
+
+        segments, has_aa = _split_by_aln(seq)
+
+        # Paired if multi-chain (not single protein), not homo-oligomer, >=2 segments have AA
+        if (not is_single_protein) and (not is_homooligomer) and (sum(has_aa) > 1):
+            header_no_gt = header.replace(">", "")
+            header_fields = header_no_gt.split("\t")
+            for j, seg in enumerate(segments):
+                label = header_fields[j] if j < len(header_fields) else (header_fields[-1] if header_fields else "")
+                pc = paired_chunks[j]
+                pc.append(">")
+                pc.append(label)
+                pc.append("\n")
+                pc.append(seg)
+                pc.append("\n")
         else:
-            for j, seq in enumerate(seqs_line):
-                if has_amino_acid[j]:
-                    unpaired_msa[j] += header + "\n"
-                    unpaired_msa[j] += seq + "\n"
+            for j, seg in enumerate(segments):
+                if has_aa[j]:
+                    uc = unpaired_chunks[j]
+                    uc.append(header)
+                    uc.append("\n")
+                    uc.append(seg)
+                    uc.append("\n")
+
     if is_homooligomer:
-        # homooligomers
         num = 101
-        paired_msa = [""] * query_seqs_cardinality[0]
-        for i in range(0, query_seqs_cardinality[0]):
-            paired_msa[i] = ">" + str(num + i) + "\n" + query_seqs_unique[0] + "\n"
-    if is_single_protein:
-        paired_msa = None
-    template_features = []
-    for query_seq in query_seqs_unique:
-        template_feature = mk_mock_template(query_seq)
-        template_features.append(template_feature)
+        count = max(query_seqs_cardinality[0], 0)
+        q = query_seqs_unique[0] if query_seqs_unique else ""
+        paired_msa = [f">{num + k}\n{q}\n" for k in range(count)]
+    else:
+        if is_single_protein:
+            paired_msa = None
+        else:
+            paired_msa = ["".join(ch) for ch in paired_chunks]
+
+
+    unpaired_msa = ["".join(ch) for ch in unpaired_chunks]
+    template_features = [mk_mock_template(q) for q in query_seqs_unique]
 
     return (
         unpaired_msa,
@@ -1082,6 +1182,7 @@ def run(
     msa_mode: str = "mmseqs2_uniref_env",
     use_templates: bool = False,
     custom_template_path: str = None,
+    custom_template_cache_path: str = None,
     num_relax: int = 0,
     relax_max_iterations: int = 0,
     relax_tolerance: float = 2.39,
@@ -1101,6 +1202,7 @@ def run(
     prediction_callback: Callable[[Any, Any, Any, Any, Any], Any] = None,
     save_single_representations: bool = False,
     save_pair_representations: bool = False,
+    skip_output: List[str] = [],
     jobname_prefix: Optional[str] = None,
     save_all: bool = False,
     save_recycles: bool = False,
@@ -1140,10 +1242,7 @@ def run(
             # disable GPU on tensorflow
             tf.config.set_visible_devices([], 'GPU')
 
-    from alphafold.notebooks.notebook_utils import get_pae_json
     from colabfold.alphafold.models import load_models_and_params
-    from colabfold.colabfold import plot_paes, plot_plddts
-    from colabfold.plot import plot_msa_v2
 
     data_dir = Path(data_dir)
     result_dir = Path(result_dir)
@@ -1277,6 +1376,7 @@ def run(
             custom_template_path = result_dir / "templates"
             put_mmciffiles_into_resultdir(pdb_hit_file, local_pdb_path, custom_template_path)
 
+
     if custom_template_path is not None:
         mk_hhsearch_db(custom_template_path)
 
@@ -1284,7 +1384,12 @@ def run(
     ranks, metrics = [],[]
     first_job = True
     job_number = 0
-    for job_number, (raw_jobname, query_sequence, a3m_lines, _) in enumerate(queries):
+    for job_number, (raw_jobname, query_sequence, a3m_lines, custom_template_path_per_entry) in enumerate(queries):
+
+        if use_templates and custom_template_path_per_entry is not None and isinstance(custom_template_path_per_entry, Path):
+            mk_hhsearch_single_entry_db(custom_template_path_per_entry, custom_template_cache_path)
+            custom_template_path = custom_template_cache_path
+
         if jobname_prefix is not None:
             # pad job number based on number of queries
             fill = len(str(len(queries)))
@@ -1330,6 +1435,8 @@ def run(
                     )
 
                 elif a3m_lines is not None:
+                    if(isinstance(a3m_lines, Path)):
+                        a3m_lines = [a3m_lines.read_text()]
                     (unpaired_msa, paired_msa, query_seqs_unique, query_seqs_cardinality, template_features) \
                     = unserialize_msa(a3m_lines, query_sequence)
                     if use_templates:
@@ -1346,8 +1453,9 @@ def run(
                     logger.info(f"Saved {pickled_msa_and_templates}")
 
             # save a3m
-            msa = msa_to_str(unpaired_msa, paired_msa, query_seqs_unique, query_seqs_cardinality)
-            result_dir.joinpath(f"{jobname}.a3m").write_text(msa)
+            if not 'msa' in skip_output:
+                msa = msa_to_str(unpaired_msa, paired_msa, query_seqs_unique, query_seqs_cardinality)
+                result_dir.joinpath(f"{jobname}.a3m").write_text(msa)
 
         except Exception as e:
             logger.exception(f"Could not get MSA/templates for {jobname}: {e}")
@@ -1376,11 +1484,13 @@ def run(
         result_files = []
 
         # make msa plot
-        msa_plot = plot_msa_v2(feature_dict, dpi=dpi)
-        coverage_png = result_dir.joinpath(f"{jobname}_coverage.png")
-        msa_plot.savefig(str(coverage_png), bbox_inches='tight')
-        msa_plot.close()
-        result_files.append(coverage_png)
+        if not 'plots' in skip_output:
+            from colabfold.plot import plot_msa_v2
+            msa_plot = plot_msa_v2(feature_dict, dpi=dpi)
+            coverage_png = result_dir.joinpath(f"{jobname}_coverage.png")
+            msa_plot.savefig(str(coverage_png), bbox_inches='tight')
+            msa_plot.close()
+            result_files.append(coverage_png)
 
         if use_templates:
             templates_file = result_dir.joinpath(f"{jobname}_template_domain_names.json")
@@ -1490,40 +1600,45 @@ def run(
             ###############
 
             # load the scores
-            scores = []
-            for r in results["rank"][:5]:
-                scores_file = result_dir.joinpath(f"{jobname}_scores_{r}.json")
-                with scores_file.open("r") as handle:
-                    scores.append(json.load(handle))
+            if not 'pae_json' in skip_output:
+                scores = []
+                for r in results["rank"][:5]:
+                    scores_file = result_dir.joinpath(f"{jobname}_scores_{r}.json")
+                    with scores_file.open("r") as handle:
+                        scores.append(json.load(handle))
 
-            # write alphafold-db format (pAE)
-            if "pae" in scores[0]:
-                af_pae_file = result_dir.joinpath(f"{jobname}_predicted_aligned_error_v1.json")
-                af_pae_file.write_text(json.dumps({
-                    "predicted_aligned_error":scores[0]["pae"],
-                    "max_predicted_aligned_error":scores[0]["max_pae"]}))
-                result_files.append(af_pae_file)
+                # write alphafold-db format (pAE)
+                if "pae" in scores[0]:
+                    af_pae_file = result_dir.joinpath(f"{jobname}_predicted_aligned_error_v1.json")
+                    af_pae_file.write_text(json.dumps({
+                        "predicted_aligned_error":scores[0]["pae"],
+                        "max_predicted_aligned_error":scores[0]["max_pae"]}))
+                    result_files.append(af_pae_file)
 
-                # make pAE plots
-                paes_plot = plot_paes([np.asarray(x["pae"]) for x in scores],
-                    Ls=query_sequence_len_array, dpi=dpi)
-                pae_png = result_dir.joinpath(f"{jobname}_pae.png")
-                paes_plot.savefig(str(pae_png), bbox_inches='tight')
-                paes_plot.close()
-                result_files.append(pae_png)
+                    # make pAE plots
+                    if not 'plots' in skip_output:
+                        from colabfold.colabfold import plot_paes
+                        paes_plot = plot_paes([np.asarray(x["pae"]) for x in scores],
+                            Ls=query_sequence_len_array, dpi=dpi)
+                        pae_png = result_dir.joinpath(f"{jobname}_pae.png")
+                        paes_plot.savefig(str(pae_png), bbox_inches='tight')
+                        paes_plot.close()
+                        result_files.append(pae_png)
 
-                # make pairwise interface metric plots and chainwise ptm plot
-                if calc_extra_ptm:
-                    ext_metric_png = result_dir.joinpath(f"{jobname}_ext_metrics.png")
-                    extra_ptm.plot_chain_pairwise_analysis(scores, fig_path=ext_metric_png)
+                    # make pairwise interface metric plots and chainwise ptm plot
+                    if calc_extra_ptm:
+                        ext_metric_png = result_dir.joinpath(f"{jobname}_ext_metrics.png")
+                        extra_ptm.plot_chain_pairwise_analysis(scores, fig_path=ext_metric_png)
 
-            # make pLDDT plot
-            plddt_plot = plot_plddts([np.asarray(x["plddt"]) for x in scores],
-                Ls=query_sequence_len_array, dpi=dpi)
-            plddt_png = result_dir.joinpath(f"{jobname}_plddt.png")
-            plddt_plot.savefig(str(plddt_png), bbox_inches='tight')
-            plddt_plot.close()
-            result_files.append(plddt_png)
+                # make pLDDT plot
+                if not 'plots' in skip_output:
+                    from colabfold.colabfold import plot_plddts
+                    plddt_plot = plot_plddts([np.asarray(x["plddt"]) for x in scores],
+                        Ls=query_sequence_len_array, dpi=dpi)
+                    plddt_png = result_dir.joinpath(f"{jobname}_plddt.png")
+                    plddt_plot.savefig(str(plddt_png), bbox_inches='tight')
+                    plddt_plot.close()
+                    result_files.append(plddt_png)
 
         if zip_results:
             with zipfile.ZipFile(result_zip, "w") as result_zip:
@@ -1685,6 +1800,12 @@ def main():
         help="Directory with PDB files to provide as custom templates to the predictor. "
         "No templates will be queried from the MSA server. "
         "'--templates' argument is also required to enable this.",
+    )
+    msa_group.add_argument(
+        "--custom-template-cache-path",
+        type=str,
+        default=None,
+        help="Directory to generate temporary HHsearch databases for custom templates.",
     )
     msa_group.add_argument(
         "--max-template-date",
@@ -1926,6 +2047,14 @@ def main():
         action="store_true",
         help="Save the pair representation embeddings of all models.",
     )
+    def comma_separated_list(arg_string):
+        return [item.strip() for item in arg_string.split(',') if item.strip() in ['msa', 'plots', 'pae_json']]
+    output_group.add_argument(
+        "--skip-output",
+        help="Comma-separated list of output types to skip: msa, plots, pae_json.",
+        type=comma_separated_list,
+        default="",
+    )
     output_group.add_argument(
         "--overwrite-existing-results",
         default=False,
@@ -2009,6 +2138,12 @@ def main():
 
     queries, is_complex = get_queries(args.input, args.sort_queries_by)
 
+    has_per_entry_templates = any(isinstance(q[3], Path) for q in queries)
+    if has_per_entry_templates and args.custom_template_cache_path is None:
+        raise ValueError("--custom-template-cache-path must be set when using per-entry template paths in CSV input")
+    if has_per_entry_templates and args.custom_template_path is not None:
+        raise ValueError("--custom-template-path and per-entry template paths in CSV input cannot be used simultaneously")
+
     model_type = set_model_type(is_complex, args.model_type)
 
     # use pdb or cif input as initial guess
@@ -2069,6 +2204,7 @@ def main():
         result_dir=args.results,
         use_templates=args.templates,
         custom_template_path=args.custom_template_path,
+        custom_template_cache_path=args.custom_template_cache_path,
         num_relax=args.num_relax,
         relax_max_iterations=args.relax_max_iterations,
         relax_tolerance=args.relax_tolerance,
@@ -2097,6 +2233,7 @@ def main():
         zip_results=args.zip,
         save_single_representations=args.save_single_representations,
         save_pair_representations=args.save_pair_representations,
+        skip_output=args.skip_output,
         use_dropout=args.use_dropout,
         max_seq=args.max_seq,
         max_extra_seq=args.max_extra_seq,
