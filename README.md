@@ -1,11 +1,8 @@
-# ColabFold - v1.5.5
+# ColabFold - v1.6.0
 
-For details of what was changed in v1.5, see [change log](https://github.com/sokrypton/ColabFold/wiki/v1.5.0)!
+For details of what was changed in v1.6.0, see [change log](https://github.com/sokrypton/ColabFold/wiki/v1.6.0)!
 
 <p align="center"><img src="https://github.com/sokrypton/ColabFold/raw/main/.github/ColabFold_Marv_Logo.png" height="250"/></p>
-
-> [!NOTE]
-> 04Aug2025: We changed the taxonomy/pairing files for the UniRef100 database. This might affect multimer predictions. Check [the wiki entry](https://github.com/sokrypton/ColabFold/wiki/MSA-Server-Database-History) for details. 
 
 ### Making Protein folding accessible to all via Google Colab!
 
@@ -32,9 +29,8 @@ Check the wiki page [old retired notebooks](https://github.com/sokrypton/ColabFo
 - Can I use the models for **Molecular Replacement**?
   - Yes, but be **CAREFUL**, the bfactor column is populated with pLDDT confidence values (higher = better). Phenix.phaser expects a "real" bfactor, where (lower = better). See [post](https://twitter.com/cheshireminima/status/1423929241675120643) from Claudia Millán.
 - What is the maximum length?
-  - Limits depends on free GPU provided by Google-Colab `fingers-crossed`
-  - For GPU: `Tesla T4` with ~16G the max length is ~2000
-  - To check what GPU you got, open a new code cell and type `!nvidia-smi`
+  - Limits depends on free GPU provided by Google Colab `fingers-crossed`
+  - For GPUs with ~16G the max length is ~2000
 - Is it okay to use the MMseqs2 MSA server on a local computer?
   - You can access the server from a local computer if you queries are serial from a single IP. Please do not use multiple computers to query the server.
 - Where can I download the databases used by ColabFold?
@@ -62,8 +58,30 @@ Check the wiki page [old retired notebooks](https://github.com/sokrypton/ColabFo
 - Where can I find the history of MSA Server Databases used in ColabFold?
   - You can view the database version history on the [MSA Server Database History](https://github.com/sokrypton/ColabFold/wiki/MSA-Server-Database-History) wiki page.
 
-### Running locally
-For instructions on how to install ColabFold locally refer to [localcolabfold](https://github.com/YoshitakaMo/localcolabfold) or see our [wiki](https://github.com/sokrypton/ColabFold/wiki/Running-ColabFold-in-Docker) on how to run ColabFold within Docker.
+### Installation
+
+For a one-step installer script that supports Linux, macOS, and Windows (WSL2), see [LocalColabFold](https://github.com/YoshitakaMo/localcolabfold).
+
+Alternatively, ColabFold can be installed directly with `conda` and `pip`:
+
+```shell
+conda create -n colabfold -c conda-forge -c bioconda python=3.13 kalign2=2.04 hhsuite=3.3.0 mmseqs2=18.8cc5c
+conda activate colabfold
+# With CUDA GPU support
+pip install colabfold[alphafold,openmm] jax[cuda] openmm[cuda12]
+# CPU only
+pip install colabfold[alphafold,openmm]
+# For colabfold_search only (no structure prediction)
+pip install colabfold
+```
+
+A Docker image is also available:
+
+```shell
+docker pull ghcr.io/sokrypton/colabfold:1.6.0-cuda12
+```
+
+See our [wiki](https://github.com/sokrypton/ColabFold/wiki/Running-ColabFold-in-Docker) for more details on running ColabFold in Docker.
 
 ### Generating MSAs for small scale local structure/complex predictions using the MSA server
 
@@ -228,6 +246,9 @@ For more details, see [GPU-accelerated search](https://github.com/soedinglab/MMs
 
 - Mirdita M, Schütze K, Moriwaki Y, Heo L, Ovchinnikov S and Steinegger M. ColabFold: Making protein folding accessible to all. <br />
   Nature Methods (2022) doi: [10.1038/s41592-022-01488-1](https://www.nature.com/articles/s41592-022-01488-1)
+- For a step-by-step protocol on how to use ColabFold, please refer to: <br />
+  Kim G & Lee S et al. Easy and accurate protein structure prediction using ColabFold. <br />
+  Nature Protocols (2025) doi: [10.1038/s41596-024-01060-5](https://www.nature.com/articles/s41596-024-01060-5)
 - If you’re using **AlphaFold**, please also cite: <br />
   Jumper et al. "Highly accurate protein structure prediction with AlphaFold." <br />
   Nature (2021) doi: [10.1038/s41586-021-03819-2](https://doi.org/10.1038/s41586-021-03819-2)
